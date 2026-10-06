@@ -36,7 +36,14 @@ enum class Error : uint8
     unsupported,
     device_lost,
     driver_error,
+    out_of_memory,
 };
+
+using ErrorCallback = void (*)(const char* message, bool fatal) noexcept;
+
+// Synchronous diagnostics on the calling thread; message is valid only during the callback. Do not call graphics APIs recursively.
+// The thread-local callback defaults to nullptr. Fatal execution errors still abort after the callback returns.
+void set_error_callback(ErrorCallback callback) noexcept;
 
 enum class MemoryType : uint8
 {
@@ -686,6 +693,7 @@ constexpr RenderingFlags operator|(RenderingFlags lhs, RenderingFlags rhs) noexc
 // Concurrent descriptor updates require disjoint destinations, and copy source slots must not be modified by another update.
 // Each (device, queue_index) and command pool (including recording its buffers) is externally synchronized; different queues/pools may run concurrently.
 // Device idle/destruction requires exclusive access. Destroy command pools before their device. There are no internal queue or pool locks.
+// Initialization and resource creation failures return an Error, nullptr, or an empty aggregate; details go to the optional error callback.
 [[nodiscard]] DeviceInit create_device(const DeviceDesc& desc = {}) noexcept;
 void destroy_device(Device* device) noexcept;
 [[nodiscard]] const DeviceCaps& get_device_caps(const Device* device) noexcept;

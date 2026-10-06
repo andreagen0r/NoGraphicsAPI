@@ -161,7 +161,8 @@ static_assert(gpu::detail::is_same_v<__underlying_type(gpu::Error), uint8> &&
 static_assert(static_cast<uint8>(gpu::Error::none) == 0 &&
               static_cast<uint8>(gpu::Error::unsupported) == 1 &&
               static_cast<uint8>(gpu::Error::device_lost) == 2 &&
-              static_cast<uint8>(gpu::Error::driver_error) == 3);
+              static_cast<uint8>(gpu::Error::driver_error) == 3 &&
+              static_cast<uint8>(gpu::Error::out_of_memory) == 4);
 static_assert(static_cast<uint32>(gpu::TextureUsage::sampled | gpu::TextureUsage::storage) == 3);
 static_assert(static_cast<uint64>(gpu::Stage::vertex | gpu::Stage::fragment) == 68);
 static_assert(static_cast<uint64>(gpu::Stage::task) == (1ull << 3u));

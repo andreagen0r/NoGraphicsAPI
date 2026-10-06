@@ -31,6 +31,8 @@ namespace gpu
 namespace
 {
 
+thread_local ErrorCallback error_callback = nullptr;
+
 constexpr uint32 max_device_extensions = 512;
 constexpr uint32 max_instance_extensions = 256;
 constexpr uint32 max_instance_layers = 64;
@@ -50,14 +52,52 @@ enum class DescriptorHeapType : uint8
     sampler,
 };
 
-[[nodiscard]] Error error_from_vk(VkResult result) noexcept
+void report_vk_failure(VkResult result, const char* operation, bool fatal, uint64 byte_count = 0) noexcept
 {
+    if (!error_callback) return;
+    const char* reason = "graphics driver error";
+    switch (result)
+    {
+    case VK_ERROR_INITIALIZATION_FAILED: reason = "VK_ERROR_INITIALIZATION_FAILED (graphics initialization failed)"; break;
+    case VK_ERROR_OUT_OF_HOST_MEMORY: reason = "VK_ERROR_OUT_OF_HOST_MEMORY (not enough system memory)"; break;
+    case VK_ERROR_OUT_OF_DEVICE_MEMORY: reason = "VK_ERROR_OUT_OF_DEVICE_MEMORY (not enough GPU memory or CPU-visible GPU memory)"; break;
+    case VK_ERROR_TOO_MANY_OBJECTS: reason = "VK_ERROR_TOO_MANY_OBJECTS (graphics resource limit reached)"; break;
+    case VK_ERROR_DEVICE_LOST: reason = "VK_ERROR_DEVICE_LOST (graphics device lost)"; break;
+    case VK_ERROR_MEMORY_MAP_FAILED: reason = "VK_ERROR_MEMORY_MAP_FAILED (GPU memory could not be mapped for CPU access)"; break;
+    case VK_ERROR_LAYER_NOT_PRESENT: reason = "VK_ERROR_LAYER_NOT_PRESENT (required Vulkan layer unavailable)"; break;
+    case VK_ERROR_EXTENSION_NOT_PRESENT: reason = "VK_ERROR_EXTENSION_NOT_PRESENT (required Vulkan extension unavailable)"; break;
+    case VK_ERROR_FEATURE_NOT_PRESENT: reason = "VK_ERROR_FEATURE_NOT_PRESENT (required graphics feature unavailable)"; break;
+    case VK_ERROR_INCOMPATIBLE_DRIVER: reason = "VK_ERROR_INCOMPATIBLE_DRIVER (incompatible graphics driver)"; break;
+    case VK_ERROR_FORMAT_NOT_SUPPORTED: reason = "VK_ERROR_FORMAT_NOT_SUPPORTED (required texture or display format unsupported)"; break;
+    case VK_ERROR_INVALID_SHADER_NV: reason = "VK_ERROR_INVALID_SHADER_NV (the graphics driver rejected the shader)"; break;
+    case VK_ERROR_UNKNOWN: reason = "VK_ERROR_UNKNOWN (unspecified graphics driver error)"; break;
+    default: break;
+    }
+    char message[512];
+    if (byte_count)
+        snprintf(message, sizeof(message), "%s failed: %s (Vulkan result %d, %.2f MiB requested).",
+            operation, reason, int(result), double(byte_count) / (1024.0 * 1024.0));
+    else
+        snprintf(message, sizeof(message), "%s failed: %s (Vulkan result %d).", operation, reason, int(result));
+    error_callback(message, fatal);
+}
+
+[[noreturn]] void abort_vk_failure(VkResult result, const char* operation, uint64 byte_count = 0) noexcept
+{
+    report_vk_failure(result, operation, true, byte_count);
+    assert(result == VK_SUCCESS && "unexpected Vulkan failure");
+    abort();
+}
+
+[[nodiscard]] Error error_from_vk(VkResult result, const char* operation, uint64 byte_count = 0) noexcept
+{
+    if (result != VK_SUCCESS) report_vk_failure(result, operation, false, byte_count);
     switch (result)
     {
     case VK_SUCCESS: return Error::none;
     case VK_ERROR_OUT_OF_HOST_MEMORY:
     case VK_ERROR_OUT_OF_DEVICE_MEMORY:
-    case VK_ERROR_TOO_MANY_OBJECTS: abort();
+    case VK_ERROR_TOO_MANY_OBJECTS: return Error::out_of_memory;
     case VK_ERROR_DEVICE_LOST: return Error::device_lost;
     case VK_ERROR_LAYER_NOT_PRESENT:
     case VK_ERROR_EXTENSION_NOT_PRESENT:
@@ -68,17 +108,10 @@ enum class DescriptorHeapType : uint8
     }
 }
 
-[[noreturn]] void abort_vk_failure(VkResult result) noexcept
-{
-    (void)result;
-    assert(result == VK_SUCCESS && "unexpected Vulkan failure");
-    abort();
-}
-
-void require_vk(VkResult result) noexcept
+void require_vk(VkResult result, const char* operation, uint64 byte_count = 0) noexcept
 {
     if (result != VK_SUCCESS)
-        abort_vk_failure(result);
+        abort_vk_failure(result, operation, byte_count);
 }
 
 void assert_vk(VkResult result) noexcept
@@ -87,10 +120,16 @@ void assert_vk(VkResult result) noexcept
     (void)result;
 }
 
-void require_error(Error error) noexcept
+void require_error(Error error, const char* operation) noexcept
 {
     if (error != Error::none)
     {
+        if (error_callback)
+        {
+            char message[256];
+            snprintf(message, sizeof(message), "%s failed (graphics error %u).", operation, uint32(error));
+            error_callback(message, true);
+        }
         assert(false && "unexpected graphics API failure");
         abort();
     }
@@ -715,7 +754,7 @@ struct Device
         return true;
     }
 
-    void create_backing_buffer(detail::BackingBuffer& output, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags required,
+    bool create_backing_buffer(detail::BackingBuffer& output, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags required,
                                VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags avoided = 0) const noexcept
     {
         output = {};
@@ -728,7 +767,7 @@ struct Device
             .queueFamilyIndexCount = queue_family_count,
             .pQueueFamilyIndices = queue_families,
         };
-        require_vk(vkCreateBuffer(device, &buffer_info, nullptr, &result.buffer));
+        if (error_from_vk(vkCreateBuffer(device, &buffer_info, nullptr, &result.buffer), "vkCreateBuffer", size) != Error::none) return false;
 
         VkMemoryRequirements requirements{};
         vkGetBufferMemoryRequirements(device, result.buffer, &requirements);
@@ -736,9 +775,19 @@ struct Device
         const bool has_memory_type = find_memory_type(
             requirements.memoryTypeBits, required, preferred,
             requirements.size, memory_type, avoided);
-        assert(has_memory_type);
         if (!has_memory_type)
-            abort();
+        {
+            if (error_callback)
+            {
+                char message[256];
+                snprintf(message, sizeof(message), "No compatible %s GPU memory heap can hold %.2f MiB.",
+                    (required & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? "CPU-visible" : "device-local",
+                    double(requirements.size) / (1024.0 * 1024.0));
+                error_callback(message, false);
+            }
+            vkDestroyBuffer(device, result.buffer, nullptr);
+            return false;
+        }
 
         const VkMemoryAllocateFlagsInfo flags_info{
             .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
@@ -750,13 +799,28 @@ struct Device
             .allocationSize = requirements.size,
             .memoryTypeIndex = memory_type,
         };
-        require_vk(vkAllocateMemory(device, &allocate_info, nullptr, &result.memory));
-        require_vk(vkBindBufferMemory(device, result.buffer, result.memory, 0));
+        const char* operation = (required & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+            ? "vkAllocateMemory (CPU-visible GPU heap)" : "vkAllocateMemory (GPU-only heap)";
+        if (error_from_vk(vkAllocateMemory(device, &allocate_info, nullptr, &result.memory), operation, requirements.size) != Error::none)
+        {
+            vkDestroyBuffer(device, result.buffer, nullptr);
+            return false;
+        }
+        if (error_from_vk(vkBindBufferMemory(device, result.buffer, result.memory, 0), "vkBindBufferMemory", requirements.size) != Error::none)
+        {
+            vkDestroyBuffer(device, result.buffer, nullptr);
+            vkFreeMemory(device, result.memory, nullptr);
+            return false;
+        }
 
         if ((required & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0)
         {
-            require_vk(vkMapMemory(
-                device, result.memory, 0, VK_WHOLE_SIZE, 0, &result.mapped));
+            if (error_from_vk(vkMapMemory(device, result.memory, 0, VK_WHOLE_SIZE, 0, &result.mapped), "vkMapMemory", requirements.size) != Error::none)
+            {
+                vkDestroyBuffer(device, result.buffer, nullptr);
+                vkFreeMemory(device, result.memory, nullptr);
+                return false;
+            }
         }
 
         const VkBufferDeviceAddressInfo address_info{
@@ -765,6 +829,7 @@ struct Device
         };
         result.address = vkGetBufferDeviceAddress(device, &address_info);
         output = result;
+        return true;
     }
 
     [[nodiscard]] GpuHeap allocate_gpu_heap(VkDeviceSize size, MemoryType memory) noexcept;
@@ -845,7 +910,7 @@ bool supports_image_create_info(Device& device, const VkImageCreateInfo& image_i
     const VkResult result = vkGetPhysicalDeviceImageFormatProperties2(device.physical_device, &format_info, &properties);
     if (result == VK_ERROR_FORMAT_NOT_SUPPORTED)
         return false;
-    require_vk(result);
+    if (error_from_vk(result, "vkGetPhysicalDeviceImageFormatProperties2") != Error::none) return false;
     if (output)
         *output = properties.imageFormatProperties;
     return fits_image_format_properties(image_info, properties.imageFormatProperties);
@@ -1077,10 +1142,10 @@ Error Device::create_present_context(detail::PresentContext& context) noexcept
     const VkSemaphoreCreateInfo semaphore_info{
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
     };
-    Error error = error_from_vk(vkCreateSemaphore(device, &semaphore_info, nullptr, &context.acquired));
+    Error error = error_from_vk(vkCreateSemaphore(device, &semaphore_info, nullptr, &context.acquired), "vkCreateSemaphore (acquire)");
     if (error != Error::none)
         return error;
-    error = error_from_vk(vkCreateSemaphore(device, &semaphore_info, nullptr, &context.rendered));
+    error = error_from_vk(vkCreateSemaphore(device, &semaphore_info, nullptr, &context.rendered), "vkCreateSemaphore (render)");
     if (error != Error::none)
     {
         destroy_present_context(context);
@@ -1089,7 +1154,7 @@ Error Device::create_present_context(detail::PresentContext& context) noexcept
     const VkFenceCreateInfo fence_info{
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
     };
-    error = error_from_vk(vkCreateFence(device, &fence_info, nullptr, &context.presented));
+    error = error_from_vk(vkCreateFence(device, &fence_info, nullptr, &context.presented), "vkCreateFence");
     if (error != Error::none) destroy_present_context(context);
     return error;
 }
@@ -1198,7 +1263,11 @@ GpuHeap Device::allocate_gpu_heap(VkDeviceSize size, MemoryType memory) noexcept
     }
 
     GpuHeapOwner* heap = new GpuHeapOwner{.state = this};
-    create_backing_buffer(heap->backing, size, universal_buffer_usage, required, preferred, avoided);
+    if (!create_backing_buffer(heap->backing, size, universal_buffer_usage, required, preferred, avoided))
+    {
+        delete heap;
+        return {};
+    }
     return {
         .range = {
             .cpu = static_cast<byte*>(heap->backing.mapped),
@@ -1226,7 +1295,11 @@ GpuHeap Device::allocate_descriptor_heap(VkDeviceSize size, DescriptorHeapType t
     const VkDeviceSize backing_size = bind_size + alignment_padding;
 
     GpuHeapOwner* heap = new GpuHeapOwner{.state = this};
-    create_backing_buffer(heap->backing, backing_size, universal_buffer_usage | VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT, cpu_visible_memory_properties, 0);
+    if (!create_backing_buffer(heap->backing, backing_size, universal_buffer_usage | VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT, cpu_visible_memory_properties, 0))
+    {
+        delete heap;
+        return {};
+    }
 
     const VkDeviceAddress gpu_address = align_up(heap->backing.address, allocation_alignment);
     const VkDeviceSize allocation_offset = gpu_address - heap->backing.address;
@@ -1352,14 +1425,14 @@ Error enumerate_device_extensions(VkPhysicalDevice physical_device, Span<VkExten
 {
     count = static_cast<uint32>(values.size);
     const VkResult result = vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &count, values.data);
-    return result == VK_INCOMPLETE ? Error::unsupported : error_from_vk(result);
+    return result == VK_INCOMPLETE ? Error::unsupported : error_from_vk(result, "vkEnumerateDeviceExtensionProperties");
 }
 
 Error enumerate_instance_extensions(Span<VkExtensionProperties> values, uint32& count) noexcept
 {
     count = static_cast<uint32>(values.size);
     const VkResult result = vkEnumerateInstanceExtensionProperties(nullptr, &count, values.data);
-    return result == VK_INCOMPLETE ? Error::unsupported : error_from_vk(result);
+    return result == VK_INCOMPLETE ? Error::unsupported : error_from_vk(result, "vkEnumerateInstanceExtensionProperties");
 }
 
 #if !defined(NDEBUG)
@@ -1367,7 +1440,7 @@ Error enumerate_instance_layers(Span<VkLayerProperties> values, uint32& count) n
 {
     count = static_cast<uint32>(values.size);
     const VkResult result = vkEnumerateInstanceLayerProperties(&count, values.data);
-    return result == VK_INCOMPLETE ? Error::unsupported : error_from_vk(result);
+    return result == VK_INCOMPLETE ? Error::unsupported : error_from_vk(result, "vkEnumerateInstanceLayerProperties");
 }
 #endif
 
@@ -1556,7 +1629,8 @@ Error inspect_candidate(VkPhysicalDevice physical_device, VkSurfaceKHR surface, 
         VkBool32 presentation_supported = VK_TRUE;
         if (surface && type == 0)
         {
-            const Error presentation_error = error_from_vk(vkGetPhysicalDeviceSurfaceSupportKHR(physical_device, index, surface, &presentation_supported));
+            const Error presentation_error = error_from_vk(vkGetPhysicalDeviceSurfaceSupportKHR(physical_device, index, surface, &presentation_supported),
+                "vkGetPhysicalDeviceSurfaceSupportKHR");
             if (presentation_error != Error::none)
                 return presentation_error;
         }
@@ -1587,11 +1661,13 @@ Error enumerate_physical_devices(VkInstance instance, Span<VkPhysicalDevice> val
 {
     count = static_cast<uint32>(values.size);
     const VkResult result = vkEnumeratePhysicalDevices(instance, &count, values.data);
-    return result == VK_INCOMPLETE ? Error::unsupported : error_from_vk(result);
+    return result == VK_INCOMPLETE ? Error::unsupported : error_from_vk(result, "vkEnumeratePhysicalDevices");
 }
 
-DeviceInit fail_device_creation(Device* device, Error error) noexcept
+DeviceInit fail_device_creation(Device* device, Error error, const char* message = nullptr) noexcept
 {
+    if (error_callback && (message || error == Error::unsupported))
+        error_callback(message ? message : "Required Vulkan device, memory, or display capabilities are unavailable.", false);
     delete device;
     return {
         .error = error,
@@ -1601,6 +1677,11 @@ DeviceInit fail_device_creation(Device* device, Error error) noexcept
 Error recreate_swapchain(Swapchain& swapchain) noexcept;
 
 } // namespace
+
+void set_error_callback(ErrorCallback callback) noexcept
+{
+    error_callback = callback;
+}
 
 DeviceInit create_device(const DeviceDesc& desc) noexcept
 {
@@ -1614,11 +1695,14 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
 #endif
 
     uint32 loader_version = VK_API_VERSION_1_0;
-    Error error = error_from_vk(vkEnumerateInstanceVersion(&loader_version));
+    Error error = error_from_vk(vkEnumerateInstanceVersion(&loader_version), "vkEnumerateInstanceVersion");
     if (error != Error::none)
         return { .error = error };
     if (loader_version < VK_API_VERSION_1_4)
+    {
+        if (error_callback) error_callback("Vulkan 1.4 or newer is required. Update the graphics driver.", false);
         return { .error = Error::unsupported };
+    }
 
     Device* state = new Device;
     state->timestamp_query_count = desc.timestamp_query_count;
@@ -1703,7 +1787,7 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
         .enabledExtensionCount = enabled_instance_extension_count,
         .ppEnabledExtensionNames = enabled_instance_extension_count ? enabled_instance_extensions : nullptr,
     };
-    error = error_from_vk(vkCreateInstance(&instance_info, nullptr, &state->instance));
+    error = error_from_vk(vkCreateInstance(&instance_info, nullptr, &state->instance), "vkCreateInstance");
     if (error != Error::none)
         return fail_device_creation(state, error);
 
@@ -1722,7 +1806,7 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
                            VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
             .pfnUserCallback = debug_callback,
         };
-        error = error_from_vk(create_debug(state->instance, &debug_info, nullptr, &state->debug_messenger));
+        error = error_from_vk(create_debug(state->instance, &debug_info, nullptr, &state->debug_messenger), "vkCreateDebugUtilsMessengerEXT");
         if (error != Error::none)
             return fail_device_creation(state, error);
     }
@@ -1736,7 +1820,7 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
             .hinstance = GetModuleHandleW(nullptr),
             .hwnd = static_cast<HWND>(desc.window),
         };
-        error = error_from_vk(vkCreateWin32SurfaceKHR(state->instance, &surface_info, nullptr, &state->surface));
+        error = error_from_vk(vkCreateWin32SurfaceKHR(state->instance, &surface_info, nullptr, &state->surface), "vkCreateWin32SurfaceKHR");
         if (error != Error::none)
             return fail_device_creation(state, error);
     }
@@ -1768,7 +1852,9 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
             break;
     }
     if (!has_selected)
-        return fail_device_creation(state, Error::unsupported);
+        return fail_device_creation(state, Error::unsupported,
+            "No compatible GPU found. Vulkan 1.4, VK_EXT_descriptor_heap, VK_KHR_device_address_commands, VK_EXT_mesh_shader, "
+            "VK_KHR_shader_untyped_pointers, and the required memory, shader, and presentation features are needed.");
 
     state->physical_device = selected.physical_device;
     state->physical_properties = selected.properties;
@@ -1871,7 +1957,7 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
         .enabledExtensionCount = enabled_device_extension_count,
         .ppEnabledExtensionNames = enabled_device_extensions,
     };
-    error = error_from_vk(vkCreateDevice(state->physical_device, &device_info, nullptr, &state->device));
+    error = error_from_vk(vkCreateDevice(state->physical_device, &device_info, nullptr, &state->device), "vkCreateDevice");
     delete[] queue_priorities;
     if (error != Error::none)
         return fail_device_creation(state, error);
@@ -1911,7 +1997,7 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
         !state->fn.cmd_draw_mesh_tasks_indirect || !state->fn.cmd_copy_memory ||
         !state->fn.cmd_copy_memory_to_image || !state->fn.cmd_copy_image_to_memory)
     {
-        return fail_device_creation(state, Error::driver_error);
+        return fail_device_creation(state, Error::driver_error, "The graphics driver did not provide the required Vulkan command entry points.");
     }
 
     if (presentation)
@@ -1924,7 +2010,7 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
             .pNext = &type_info,
         };
-        error = error_from_vk(vkCreateSemaphore(state->device, &semaphore_info, nullptr, &state->presentation_retirement));
+        error = error_from_vk(vkCreateSemaphore(state->device, &semaphore_info, nullptr, &state->presentation_retirement), "vkCreateSemaphore (presentation)");
         if (error != Error::none)
             return fail_device_creation(state, error);
         for (uint32 index = 0; index < state->present_context_count; ++index)
@@ -1988,7 +2074,11 @@ TimelineSemaphore* create_timeline_semaphore(Device* device, uint64 initial_valu
     TimelineSemaphore* result = new TimelineSemaphore{
         .state = device,
     };
-    require_vk(vkCreateSemaphore(device->device, &create_info, nullptr, &result->semaphore));
+    if (error_from_vk(vkCreateSemaphore(device->device, &create_info, nullptr, &result->semaphore), "vkCreateSemaphore (timeline)") != Error::none)
+    {
+        delete result;
+        return nullptr;
+    }
     return result;
 }
 
@@ -2139,15 +2229,15 @@ VkCompositeAlphaFlagBitsKHR choose_composite_alpha(VkCompositeAlphaFlagsKHR supp
         if ((supported & choice) != 0)
             return choice;
     }
-    assert(false && "surface exposes no composite alpha mode");
-    abort();
+    return static_cast<VkCompositeAlphaFlagBitsKHR>(0);
 }
 
 [[nodiscard]] bool swapchain_surface_configuration_changed(const Swapchain& swapchain) noexcept
 {
     VkSurfaceCapabilitiesKHR capabilities{};
-    const Error error = error_from_vk(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(swapchain.state->physical_device, swapchain.state->surface, &capabilities));
-    require_error(error);
+    const Error error = error_from_vk(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(swapchain.state->physical_device, swapchain.state->surface, &capabilities),
+        "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    require_error(error, "Display surface query");
 
     const VkExtent2D extent = capabilities.currentExtent;
     const uint32 variable_extent = UINT_MAX;
@@ -2175,7 +2265,8 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
     VkSurfaceCapabilities2KHR capabilities_info{
         .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR,
     };
-    Error error = error_from_vk(vkGetPhysicalDeviceSurfaceCapabilities2KHR(device.physical_device, &surface_info, &capabilities_info));
+    Error error = error_from_vk(vkGetPhysicalDeviceSurfaceCapabilities2KHR(device.physical_device, &surface_info, &capabilities_info),
+        "vkGetPhysicalDeviceSurfaceCapabilities2KHR");
     if (error != Error::none)
         return error;
     const VkSurfaceCapabilitiesKHR& capabilities = capabilities_info.surfaceCapabilities;
@@ -2190,12 +2281,14 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
 
     VkSurfaceFormatKHR formats[max_surface_formats]{};
     uint32 surface_format_count = 0;
-    error = error_from_vk(vkGetPhysicalDeviceSurfaceFormatsKHR(device.physical_device, device.surface, &surface_format_count, nullptr));
+    error = error_from_vk(vkGetPhysicalDeviceSurfaceFormatsKHR(device.physical_device, device.surface, &surface_format_count, nullptr),
+        "vkGetPhysicalDeviceSurfaceFormatsKHR");
     if (error != Error::none)
         return error;
     if (surface_format_count == 0 || surface_format_count > max_surface_formats)
         return Error::unsupported;
-    error = error_from_vk(vkGetPhysicalDeviceSurfaceFormatsKHR(device.physical_device, device.surface, &surface_format_count, formats));
+    error = error_from_vk(vkGetPhysicalDeviceSurfaceFormatsKHR(device.physical_device, device.surface, &surface_format_count, formats),
+        "vkGetPhysicalDeviceSurfaceFormatsKHR");
     if (error != Error::none)
         return error;
 
@@ -2228,6 +2321,11 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
     if (requested_image_count == 0 || requested_image_count > max_swapchain_images) return Error::unsupported;
 
     const VkCompositeAlphaFlagBitsKHR composite_alpha = choose_composite_alpha(capabilities.supportedCompositeAlpha);
+    if (!composite_alpha)
+    {
+        if (error_callback) error_callback("The display surface exposes no supported composite alpha mode.", false);
+        return Error::unsupported;
+    }
     const VkSwapchainKHR old_handle = swapchain.handle;
     const VkSwapchainPresentModesCreateInfoKHR present_modes_info{
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR,
@@ -2254,7 +2352,7 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
         .oldSwapchain = old_handle,
     };
     VkSwapchainKHR new_handle = VK_NULL_HANDLE;
-    error = error_from_vk(vkCreateSwapchainKHR(device.device, &create_info, nullptr, &new_handle));
+    error = error_from_vk(vkCreateSwapchainKHR(device.device, &create_info, nullptr, &new_handle), "vkCreateSwapchainKHR");
     if (error != Error::none)
     {
         retire_swapchain_handle(swapchain);
@@ -2268,14 +2366,14 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
     {
         vkDestroySwapchainKHR(device.device, new_handle, nullptr);
         retire_swapchain_handle(swapchain);
-        return result == VK_SUCCESS ? Error::unsupported : error_from_vk(result);
+        return result == VK_SUCCESS ? Error::unsupported : error_from_vk(result, "vkGetSwapchainImagesKHR");
     }
     result = vkGetSwapchainImagesKHR(device.device, new_handle, &image_count, images);
     if (result != VK_SUCCESS)
     {
         vkDestroySwapchainKHR(device.device, new_handle, nullptr);
         retire_swapchain_handle(swapchain);
-        return error_from_vk(result);
+        return error_from_vk(result, "vkGetSwapchainImagesKHR");
     }
 
     VkImageView views[max_swapchain_images]{};
@@ -2301,7 +2399,7 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
             }
             vkDestroySwapchainKHR(device.device, new_handle, nullptr);
             retire_swapchain_handle(swapchain);
-            return error_from_vk(result);
+            return error_from_vk(result, "vkCreateImageView (swapchain)");
         }
     }
 
@@ -2352,7 +2450,7 @@ Error set_swapchain_format(Device* device, Format format, ColorSpace color_space
         swapchain.color_space = old_color_space;
         // vkCreateSwapchainKHR retires oldSwapchain even when creation fails.
         if (!swapchain.handle)
-            require_error(recreate_swapchain(swapchain));
+            require_error(recreate_swapchain(swapchain), "Swapchain recreation");
     }
     return error;
 }
@@ -2365,12 +2463,14 @@ uint32x2 get_drawable_extent(Device* device) noexcept
         return {};
 
     VkSurfaceCapabilitiesKHR capabilities{};
-    const Error error = error_from_vk(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device->physical_device, device->surface, &capabilities));
-    require_error(error);
+    const Error error = error_from_vk(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device->physical_device, device->surface, &capabilities),
+        "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    if (error != Error::none) return {};
     const VkExtent2D extent = capabilities.currentExtent;
     if (extent.width == UINT_MAX || extent.height == UINT_MAX)
     {
-        require_error(Error::unsupported);
+        if (error_callback) error_callback("The display surface does not provide a fixed drawable extent.", false);
+        return {};
     }
 
     Swapchain& swapchain = *device->swapchain;
@@ -2399,7 +2499,7 @@ SwapchainFrame acquire(CommandBuffer* commands) noexcept
         if (!swapchain->handle || swapchain->recreate_required)
         {
             const Error error = recreate_swapchain(*swapchain);
-            require_error(error);
+            require_error(error, "Swapchain recreation");
             const bool drawable = swapchain->handle && swapchain->width != 0 && swapchain->height != 0;
             if (!drawable)
                 return {};
@@ -2426,7 +2526,7 @@ SwapchainFrame acquire(CommandBuffer* commands) noexcept
             continue;
         }
         if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
-            abort_vk_failure(result);
+            abort_vk_failure(result, "vkAcquireNextImageKHR");
         assert((image_index < swapchain->image_count) && "swapchain returned an invalid image index");
 
         swapchain->image_index = image_index;
@@ -2551,7 +2651,11 @@ TextureHeap create_texture_heap(Device* device, uint64 byte_count) noexcept
         .allocationSize = byte_count,
         .memoryTypeIndex = device->texture_memory_type,
     };
-    require_vk(vkAllocateMemory(device->device, &allocate_info, nullptr, &owner->memory));
+    if (error_from_vk(vkAllocateMemory(device->device, &allocate_info, nullptr, &owner->memory), "vkAllocateMemory (texture heap)", byte_count) != Error::none)
+    {
+        delete owner;
+        return {};
+    }
     return {
         .size = byte_count,
         .owner = owner,
@@ -2570,6 +2674,11 @@ SizeAlign get_texture_size_align(Device* device, const TextureDesc& desc) noexce
     assert(device && "get_texture_size_align called with a null device");
     PreparedTexture texture{};
     prepare_texture(*device, desc, texture);
+    if (!supports_image_create_info(*device, texture.image_info))
+    {
+        if (error_callback) error_callback("The GPU cannot create the requested texture format, usage, or extent.", false);
+        return {};
+    }
     const VkMemoryRequirements requirements = image_memory_requirements(*device, texture.image_info);
     return {
         .size = requirements.size,
@@ -2593,8 +2702,17 @@ Texture* create_texture(CommandBuffer* commands, const TextureDesc& desc, const 
         .type = desc.type,
         .format = desc.format,
     };
-    require_vk(vkCreateImage(device->device, &texture.image_info, nullptr, &result->image));
-    require_vk(vkBindImageMemory(device->device, result->image, heap.owner->memory, offset));
+    if (error_from_vk(vkCreateImage(device->device, &texture.image_info, nullptr, &result->image), "vkCreateImage") != Error::none)
+    {
+        result->image = VK_NULL_HANDLE;
+        delete result;
+        return nullptr;
+    }
+    if (error_from_vk(vkBindImageMemory(device->device, result->image, heap.owner->memory, offset), "vkBindImageMemory") != Error::none)
+    {
+        delete result;
+        return nullptr;
+    }
     if (desc.aliasable) return result;
 
     const VkImageMemoryBarrier2 barrier{
@@ -2685,7 +2803,11 @@ RenderView* create_render_view(Texture* texture, const RenderViewDesc& desc) noe
             .layerCount = 1,
         },
     };
-    require_vk(vkCreateImageView(texture->state->device, &view_info, nullptr, &result->view));
+    if (error_from_vk(vkCreateImageView(texture->state->device, &view_info, nullptr, &result->view), "vkCreateImageView") != Error::none)
+    {
+        delete result;
+        return nullptr;
+    }
     return result;
 }
 
@@ -2700,11 +2822,17 @@ void destroy_render_view(RenderView* render_view) noexcept
 TextureDescriptorHeap* create_texture_descriptor_heap(Device* device, uint32 capacity) noexcept
 {
     assert(device && capacity);
-    return new TextureDescriptorHeap{
+    TextureDescriptorHeap* heap = new TextureDescriptorHeap{
         .state = device,
         .storage = device->allocate_descriptor_heap(uint64(capacity) * device->heap_properties.imageDescriptorSize, DescriptorHeapType::texture),
         .capacity = capacity,
     };
+    if (!heap->storage.owner)
+    {
+        delete heap;
+        return nullptr;
+    }
+    return heap;
 }
 
 void destroy_texture_descriptor_heap(TextureDescriptorHeap* heap) noexcept
@@ -2717,11 +2845,17 @@ void destroy_texture_descriptor_heap(TextureDescriptorHeap* heap) noexcept
 SamplerDescriptorHeap* create_sampler_descriptor_heap(Device* device, uint32 capacity) noexcept
 {
     assert(device && capacity);
-    return new SamplerDescriptorHeap{
+    SamplerDescriptorHeap* heap = new SamplerDescriptorHeap{
         .state = device,
         .storage = device->allocate_descriptor_heap(uint64(capacity) * device->heap_properties.samplerDescriptorSize, DescriptorHeapType::sampler),
         .capacity = capacity,
     };
+    if (!heap->storage.owner)
+    {
+        delete heap;
+        return nullptr;
+    }
+    return heap;
 }
 
 void destroy_sampler_descriptor_heap(SamplerDescriptorHeap* heap) noexcept
@@ -3010,7 +3144,11 @@ PSO* create_raster_pso(Device* device, const ShaderStage& first_stage, const Sha
         .state = device,
         .bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS,
     };
-    require_vk(vkCreateGraphicsPipelines(device->device, VK_NULL_HANDLE, 1, &pso_info, nullptr, &result->pso));
+    if (error_from_vk(vkCreateGraphicsPipelines(device->device, VK_NULL_HANDLE, 1, &pso_info, nullptr, &result->pso), "vkCreateGraphicsPipelines") != Error::none)
+    {
+        delete result;
+        return nullptr;
+    }
     return result;
 }
 
@@ -3064,7 +3202,11 @@ PSO* create_compute_pso(Device* device, const ShaderStage& compute) noexcept
         .state = device,
         .bind_point = VK_PIPELINE_BIND_POINT_COMPUTE,
     };
-    require_vk(vkCreateComputePipelines(device->device, VK_NULL_HANDLE, 1, &pso_info, nullptr, &result->pso));
+    if (error_from_vk(vkCreateComputePipelines(device->device, VK_NULL_HANDLE, 1, &pso_info, nullptr, &result->pso), "vkCreateComputePipelines") != Error::none)
+    {
+        delete result;
+        return nullptr;
+    }
     return result;
 }
 
@@ -3082,7 +3224,11 @@ CommandPool* create_command_pool(Device* device, uint32 queue_index) noexcept
         .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
         .queueFamilyIndex = device->queues[queue_index].family_index,
     };
-    require_vk(vkCreateCommandPool(device->device, &pool_info, nullptr, &pool->command_pool));
+    if (error_from_vk(vkCreateCommandPool(device->device, &pool_info, nullptr, &pool->command_pool), "vkCreateCommandPool") != Error::none)
+    {
+        delete pool;
+        return nullptr;
+    }
     return pool;
 }
 
@@ -3147,7 +3293,11 @@ CommandBuffer* begin_commands(CommandPool* pool) noexcept
             .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
             .commandBufferCount = 1,
         };
-        require_vk(vkAllocateCommandBuffers(pool->state->device, &allocate_info, &commands->command_buffer));
+        if (error_from_vk(vkAllocateCommandBuffers(pool->state->device, &allocate_info, &commands->command_buffer), "vkAllocateCommandBuffers") != Error::none)
+        {
+            delete commands;
+            return nullptr;
+        }
         if (pool->timestamps)
         {
             const VkQueryPoolCreateInfo query_info{
@@ -3155,7 +3305,12 @@ CommandBuffer* begin_commands(CommandPool* pool) noexcept
                 .queryType = VK_QUERY_TYPE_TIMESTAMP,
                 .queryCount = pool->state->timestamp_query_count,
             };
-            require_vk(vkCreateQueryPool(pool->state->device, &query_info, nullptr, &commands->timestamp_pool));
+            if (error_from_vk(vkCreateQueryPool(pool->state->device, &query_info, nullptr, &commands->timestamp_pool), "vkCreateQueryPool") != Error::none)
+            {
+                vkFreeCommandBuffers(pool->state->device, pool->command_pool, 1, &commands->command_buffer);
+                delete commands;
+                return nullptr;
+            }
             commands->timestamp_destinations = static_cast<uint64**>(malloc(sizeof(uint64*) * pool->state->timestamp_query_count));
             commands->timestamp_results = static_cast<uint64*>(malloc(sizeof(uint64) * pool->state->timestamp_query_count));
         }
@@ -3194,7 +3349,7 @@ void end_commands(CommandBuffer* commands) noexcept
                 .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
                 .commandBufferCount = 1,
             };
-            require_vk(vkAllocateCommandBuffers(commands->state->device, &allocate_info, &commands->epilogue));
+            require_vk(vkAllocateCommandBuffers(commands->state->device, &allocate_info, &commands->epilogue), "vkAllocateCommandBuffers (epilogue)");
         }
         const VkCommandBufferBeginInfo begin_info{
             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -3397,7 +3552,7 @@ void submit_and_present(Device* device, const SubmitDesc& desc) noexcept
     else if (result == VK_SUBOPTIMAL_KHR)
         swapchain->recreate_required = swapchain->recreate_required || swapchain_surface_configuration_changed(*swapchain);
     else if (result != VK_SUCCESS)
-        abort_vk_failure(result);
+        abort_vk_failure(result, "vkQueuePresentKHR");
 }
 
 void wait_idle(Device* device) noexcept
